@@ -1,0 +1,15 @@
+[Unit]
+Description=TASCAM US-1641 PipeWire Audio Bridge Daemon
+After=pipewire.service
+BindsTo=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/tascamd
+Restart=always
+RestartSec=3s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

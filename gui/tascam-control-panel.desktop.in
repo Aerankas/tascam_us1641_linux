@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=TASCAM US-1641 Control Panel
+Comment=Hardware settings, sample rate, and buffer latency configuration for TASCAM US-1641
+Exec=@BINDIR@/tascam-control-panel
+Icon=audio-card
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;AudioVideoEditing;Settings;HardwareSettings;
+Keywords=tascam;us1641;audio;latency;buffer;quantum;sample rate;pipewire;
+StartupNotify=true

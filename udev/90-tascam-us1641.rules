@@ -1,0 +1,2 @@
+# Grant user-level access to TASCAM US-1641 USB 2.0 Audio Interface (0644:8017)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0644", ATTRS{idProduct}=="8017", TAG+="uaccess", MODE="0666"

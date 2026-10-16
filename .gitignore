@@ -1,0 +1,20 @@
+# Compiled binaries and build artifacts
+build/
+tascamd
+src/tascamd
+*.o
+
+# Generated service and desktop files
+systemd/tascamd.service
+gui/tascam-control-panel.desktop
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary & editor files
+*.bak
+*.swp
+*~
+.DS_Store
