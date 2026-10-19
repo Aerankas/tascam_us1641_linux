@@ -1,8 +1,10 @@
+VERSION ?= $(shell cat VERSION 2>/dev/null || echo "1.0.0")
+
 CC ?= gcc
 PKG_CONFIG ?= pkg-config
 
 CFLAGS ?= -O2 -Wall -Wextra
-override CFLAGS += -D_GNU_SOURCE $(shell $(PKG_CONFIG) --cflags libpipewire-0.3 libusb-1.0)
+override CFLAGS += -D_GNU_SOURCE -DTASCAMD_VERSION=\"$(VERSION)\" $(shell $(PKG_CONFIG) --cflags libpipewire-0.3 libusb-1.0)
 LDFLAGS += $(shell $(PKG_CONFIG) --libs libpipewire-0.3 libusb-1.0) -lpthread -lm
 
 PREFIX ?= $(HOME)/.local
@@ -28,7 +30,8 @@ install: $(TARGET)
 	@echo "[INFO] Installing tascamd and tascam-control-panel to $(BINDIR)..."
 	mkdir -p "$(BINDIR)"
 	install -m 0755 "$(TARGET)" "$(BINDIR)/tascamd"
-	install -m 0755 gui/tascam_control_panel.py "$(BINDIR)/tascam-control-panel"
+	sed "s|@VERSION@|$(VERSION)|g" gui/tascam_control_panel.py > "$(BINDIR)/tascam-control-panel"
+	chmod 0755 "$(BINDIR)/tascam-control-panel"
 	@echo "[INFO] Installing systemd user service to $(SYSTEMD_USER_DIR)..."
 	mkdir -p "$(SYSTEMD_USER_DIR)"
 	sed "s|@BINDIR@|$(BINDIR)|g" systemd/tascamd.service.in > "$(SYSTEMD_USER_DIR)/tascamd.service"
