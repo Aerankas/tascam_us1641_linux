@@ -26,6 +26,31 @@
 #include <spa/param/audio/format-utils.h>
 #include <libusb.h>
 
+/* Compatibility fallback macros for older libpipewire-0.3 versions (e.g. PipeWire < 1.2 on Ubuntu 24.04 LTS / Mint 22) */
+#ifndef PW_KEY_NODE_PHYSICAL
+#define PW_KEY_NODE_PHYSICAL "node.physical"
+#endif
+
+#ifndef PW_KEY_NODE_TERMINAL
+#define PW_KEY_NODE_TERMINAL "node.terminal"
+#endif
+
+#ifndef PW_KEY_PORT_PHYSICAL
+#define PW_KEY_PORT_PHYSICAL "port.physical"
+#endif
+
+#ifndef PW_KEY_PORT_TERMINAL
+#define PW_KEY_PORT_TERMINAL "port.terminal"
+#endif
+
+#ifndef PW_KEY_NODE_DEVICE_PORT_NAME_PREFIX
+#define PW_KEY_NODE_DEVICE_PORT_NAME_PREFIX "node.device-port-name-prefix"
+#endif
+
+#ifndef PW_KEY_NODE_CHANNELNAMES
+#define PW_KEY_NODE_CHANNELNAMES "node.channel-names"
+#endif
+
 #ifndef TASCAMD_VERSION
 #define TASCAMD_VERSION "1.0.0"
 #endif
