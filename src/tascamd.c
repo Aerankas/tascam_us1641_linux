@@ -26,7 +26,9 @@
 #include <spa/param/audio/format-utils.h>
 #include <libusb.h>
 
+#ifndef TASCAMD_VERSION
 #define TASCAMD_VERSION "1.0.0"
+#endif
 
 #define VENDOR_ID   0x0644
 #define PRODUCT_ID  0x8017
@@ -602,7 +604,25 @@ static void LIBUSB_CALL bulk_in_cb(struct libusb_transfer *transfer) {
         return;
     }
 
-    if (transfer->status == LIBUSB_TRANSFER_COMPLETED && transfer->actual_length > 0) {
+    if (transfer->status != LIBUSB_TRANSFER_COMPLETED) {
+        if (transfer->status == LIBUSB_TRANSFER_STALL) {
+            fprintf(stderr, "[WARN] Bulk IN (EP 0x86) stalled. Clearing endpoint halt...\n");
+            int cr = libusb_clear_halt(g_handle, EP_BULK_IN);
+            if (cr < 0) {
+                fprintf(stderr, "[ERROR] libusb_clear_halt failed: %s\n", libusb_strerror(cr));
+            }
+        } else if (transfer->status == LIBUSB_TRANSFER_ERROR) {
+            fprintf(stderr, "[WARN] Bulk IN (EP 0x86) transfer error. Clearing halt...\n");
+            int cr = libusb_clear_halt(g_handle, EP_BULK_IN);
+            if (cr < 0) {
+                fprintf(stderr, "[ERROR] libusb_clear_halt failed: %s\n", libusb_strerror(cr));
+            }
+        } else if (transfer->status == LIBUSB_TRANSFER_OVERFLOW) {
+            fprintf(stderr, "[WARN] Bulk IN (EP 0x86) overflow.\n");
+        } else {
+            fprintf(stderr, "[WARN] Bulk IN (EP 0x86) transfer status: %d\n", transfer->status);
+        }
+    } else if (transfer->actual_length > 0) {
         const unsigned char *bulk_buf = transfer->buffer;
         int num_frames = transfer->actual_length / 32;
 

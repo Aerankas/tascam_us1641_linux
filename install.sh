@@ -16,8 +16,10 @@ success() { printf "${C_GREEN}[OK]${C_RESET} %s\n" "$*"; }
 warn()    { printf "${C_YELLOW}[WARN]${C_RESET} %s\n" "$*"; }
 error()   { printf "${C_RED}[ERROR]${C_RESET} %s\n" "$*" >&2; }
 
+VERSION="$(tr -d ' \r\n' < "${SCRIPT_DIR}/VERSION" 2>/dev/null || echo "1.0.0")"
+
 echo "================================================================"
-echo "  TASCAM US-1641 Linux PipeWire Driver & Control Panel Installer"
+echo "  TASCAM US-1641 Linux PipeWire Driver v${VERSION} Installer"
 echo "================================================================"
 
 # 1. Check build & runtime dependencies

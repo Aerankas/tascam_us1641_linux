@@ -22,6 +22,15 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 CONFIG_PATH = os.path.expanduser("~/.config/tascamd.conf")
 
+__version__ = "@VERSION@"
+if __version__.startswith("@"):
+    try:
+        _vpath = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "VERSION")
+        with open(_vpath, "r") as _f:
+            __version__ = _f.read().strip()
+    except Exception:
+        __version__ = "1.0.0"
+
 
 def get_runtime_stats_path():
     xdg_runtime = os.environ.get("XDG_RUNTIME_DIR", "")
@@ -142,7 +151,7 @@ def get_service_status():
 class TascamControlWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TASCAM US-1641 Control Panel")
+        self.setWindowTitle(f"TASCAM US-1641 Control Panel v{__version__}")
         self.setMinimumSize(550, 530)
         self.setWindowIcon(QtGui.QIcon.fromTheme("audio-card"))
 
