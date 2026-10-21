@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Added fallback preprocessor macros for `PW_KEY_NODE_PHYSICAL`, `PW_KEY_NODE_TERMINAL`, and related PipeWire properties, fixing compilation failure on older `libpipewire-0.3` versions such as PipeWire < 1.2 on Ubuntu 24.04 LTS and Linux Mint 22 ([#1](https://github.com/Aerankas/tascam_us1641_linux/issues/1)).
 - Added self-healing recovery for USB Bulk IN endpoint stalls (`EP 0x86`) via `libusb_clear_halt()`, preventing permanent audio capture silence on host idle or USB power management transitions ([#3](https://github.com/Aerankas/tascam_us1641_linux/issues/3)).
 
 ## [1.0.0] - 2026-10-16
