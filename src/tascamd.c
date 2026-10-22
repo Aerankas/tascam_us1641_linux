@@ -77,9 +77,9 @@
 #define FB_PACKET_SIZE    64
 
 #define NUM_MIDI_IN_TRANSFERS 4
-#define MIDI_IN_BUF_SIZE      64
+#define MIDI_IN_BUF_SIZE      512
 #define MIDI_PAD_BYTE         0xFD
-#define MIDI_DELIM_BYTE       0xE0
+#define MIDI_DELIM_BYTE       0x00
 
 #define SINK_CHANNELS   4
 #define SOURCE_CHANNELS 16
@@ -809,61 +809,33 @@ static void LIBUSB_CALL midi_in_cb(struct libusb_transfer *transfer) {
         }
 
         while (g_midi_in_acc_len >= 9) {
-            if (g_midi_in_acc[8] == MIDI_DELIM_BYTE) {
-                for (int i = 0; i < 8; i++) {
-                    uint8_t byte = g_midi_in_acc[i];
-                    if (byte != MIDI_PAD_BYTE && g_midi_in_coder && g_seq_handle) {
-                        snd_seq_event_t ev;
-                        snd_seq_ev_clear(&ev);
-                        int res = snd_midi_event_encode_byte(g_midi_in_coder, byte, &ev);
-                        if (res > 0) {
-                            snd_seq_ev_set_source(&ev, g_seq_in_port);
-                            snd_seq_ev_set_subs(&ev);
-                            snd_seq_ev_set_direct(&ev);
-                            pthread_mutex_lock(&g_seq_lock);
-                            snd_seq_event_output_direct(g_seq_handle, &ev);
-                            pthread_mutex_unlock(&g_seq_lock);
+            int payload_len = 8;
+            while (payload_len > 0 && g_midi_in_acc[payload_len - 1] == MIDI_PAD_BYTE) {
+                payload_len--;
+            }
+
+            for (int i = 0; i < payload_len; i++) {
+                uint8_t byte = g_midi_in_acc[i];
+                if (g_midi_in_coder && g_seq_handle) {
+                    snd_seq_event_t ev;
+                    snd_seq_ev_clear(&ev);
+                    int res = snd_midi_event_encode_byte(g_midi_in_coder, byte, &ev);
+                    if (res > 0) {
+                        snd_seq_ev_set_source(&ev, g_seq_in_port);
+                        snd_seq_ev_set_subs(&ev);
+                        snd_seq_ev_set_direct(&ev);
+                        pthread_mutex_lock(&g_seq_lock);
+                        snd_seq_event_output_direct(g_seq_handle, &ev);
+                        pthread_mutex_unlock(&g_seq_lock);
+                        if (ev.type != SND_SEQ_EVENT_SENSING) {
                             g_midi_in_events_count++;
                         }
                     }
                 }
-                memmove(g_midi_in_acc, g_midi_in_acc + 9, g_midi_in_acc_len - 9);
-                g_midi_in_acc_len -= 9;
-            } else {
-                int sync_idx = -1;
-                for (int s = 0; s < g_midi_in_acc_len; s++) {
-                    if (g_midi_in_acc[s] == MIDI_DELIM_BYTE) {
-                        sync_idx = s;
-                        break;
-                    }
-                }
-                if (sync_idx >= 0) {
-                    if (sync_idx >= 8) {
-                        int frame_start = sync_idx - 8;
-                        for (int i = 0; i < 8; i++) {
-                            uint8_t byte = g_midi_in_acc[frame_start + i];
-                            if (byte != MIDI_PAD_BYTE && g_midi_in_coder && g_seq_handle) {
-                                snd_seq_event_t ev;
-                                snd_seq_ev_clear(&ev);
-                                int res = snd_midi_event_encode_byte(g_midi_in_coder, byte, &ev);
-                                if (res > 0) {
-                                    snd_seq_ev_set_source(&ev, g_seq_in_port);
-                                    snd_seq_ev_set_subs(&ev);
-                                    snd_seq_ev_set_direct(&ev);
-                                    pthread_mutex_lock(&g_seq_lock);
-                                    snd_seq_event_output_direct(g_seq_handle, &ev);
-                                    pthread_mutex_unlock(&g_seq_lock);
-                                    g_midi_in_events_count++;
-                                }
-                            }
-                        }
-                    }
-                    memmove(g_midi_in_acc, g_midi_in_acc + sync_idx + 1, g_midi_in_acc_len - (sync_idx + 1));
-                    g_midi_in_acc_len -= (sync_idx + 1);
-                } else {
-                    g_midi_in_acc_len = 0;
-                }
             }
+
+            memmove(g_midi_in_acc, g_midi_in_acc + 9, g_midi_in_acc_len - 9);
+            g_midi_in_acc_len -= 9;
         }
         pthread_mutex_unlock(&g_midi_in_lock);
     } else if (transfer->status == LIBUSB_TRANSFER_STALL) {
@@ -1179,7 +1151,15 @@ int main(int argc, char **argv) {
         libusb_fill_bulk_transfer(midi_in_xfers[t], g_handle, EP_MIDI_IN, midi_in_bufs[t],
                                   MIDI_IN_BUF_SIZE, midi_in_cb, NULL, 0);
         g_active_midi_in_transfers++;
-        libusb_submit_transfer(midi_in_xfers[t]);
+        int r = libusb_submit_transfer(midi_in_xfers[t]);
+        if (r < 0) {
+            fprintf(stderr, "[ERROR] libusb_submit_transfer MIDI IN %d failed: %d (%s)\n",
+                    t, r, libusb_error_name(r));
+            g_active_midi_in_transfers--;
+        } else {
+            fprintf(stderr, "[INFO] Submitted MIDI IN transfer %d (EP 0x%02X, size %d)\n",
+                    t, EP_MIDI_IN, MIDI_IN_BUF_SIZE);
+        }
     }
 
     printf("[RUNNING] Full-Duplex Multi-Track Audio Bridge active! Managing active drift regulation...\n");

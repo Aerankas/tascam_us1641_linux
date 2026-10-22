@@ -120,14 +120,14 @@ The US-1641 features standard 5-pin DIN MIDI IN and MIDI OUT ports routed over d
 ### Frame Structure & Framing (9-Byte Packets)
 
 Both input and output streams use fixed 9-byte packet framing:
-- **Bytes `0..7` (8 bytes)**: Raw MIDI message payload (Note-On, Note-Off, CC, Aftertouch, SysEx, etc.).
+- **Bytes `0..7` (8 bytes)**: Raw MIDI message payload (Note-On, Note-Off, CC, Aftertouch, Active Sensing, SysEx, etc.).
   - Unused or idle byte slots within the 8-byte payload are padded with `0xFD`.
-- **Byte `8` (1 byte)**: Frame delimiter byte, fixed at `0xE0`.
+- **Byte `8` (1 byte)**: Frame delimiter byte, set to `0x00`.
 
 ```
 +--------+--------+--------+--------+--------+--------+--------+--------+--------+
 | Byte 0 | Byte 1 | Byte 2 | Byte 3 | Byte 4 | Byte 5 | Byte 6 | Byte 7 | Byte 8 |
-|   M0   |   M1   |   M2   |  0xFD  |  0xFD  |  0xFD  |  0xFD  |  0xFD  |  0xE0  |
+|   M0   |   M1   |   M2   |  0xFD  |  0xFD  |  0xFD  |  0xFD  |  0xFD  |  0x00  |
 +--------+--------+--------+--------+--------+--------+--------+--------+--------+
  <---------------- Raw MIDI Payload (Padded with 0xFD) ---------------> <Delim>
 ```
