@@ -5,15 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.0] - 2026-10-22
-
-### Added
-- Full hardware MIDI Input and Output support for the US-1641's 5-pin DIN ports via USB bulk endpoints `EP 0x83` (MIDI IN) and `EP 0x04` (MIDI OUT) ([#7](https://github.com/Aerankas/tascam_us1641_linux/issues/7)):
-  - Implemented 9-byte USB frame packetizer and depacketizer with `0xFD` pad filtering and `0xE0` delimiter alignment.
-  - Native ALSA Sequencer integration (`TASCAM US-1641 MIDI In` and `MIDI Out`) with bidirectional byte translation.
-  - Seamless automatic PipeWire/JACK graph bridging (`Midi-Bridge:TASCAM US-1641:MIDI In (capture)` and `MIDI Out (playback)`) for low-latency digital drum kits, keyboards, synthesizers, and DAWs.
-  - Live MIDI I/O event counters in daemon telemetry (`tascamd.stats`).
-  - Added `libasound2-dev` / `alsa-lib-devel` dependency checks to `install.sh` and build system.
+## [Unreleased]
 
 ### Fixed
 - Fixed 32-bit signed integer overflow in Bulk IN frame parity decoder (`g_global_frame_idx`), which caused permanent capture silence after 6.2 hours of continuous streaming ([#5](https://github.com/Aerankas/tascam_us1641_linux/issues/5)).

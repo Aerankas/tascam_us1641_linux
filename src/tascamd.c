@@ -20,9 +20,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <time.h>
-#include <poll.h>
 #include <pthread.h>
-#include <alsa/asoundlib.h>
 #include <pipewire/pipewire.h>
 #include <pipewire/thread-loop.h>
 #include <spa/param/audio/format-utils.h>
@@ -63,9 +61,6 @@
 #define EP_ISO_OUT    0x02
 #define EP_ISO_IN_FB  0x81
 #define EP_BULK_IN    0x86
-#define EP_MIDI_IN    0x83
-#define EP_MIDI_OUT   0x04
-
 #define BULK_BUF_SIZE 16384 // 16 KB = 512 frames = 256 sample pairs (~5.3 ms at 48kHz)
 #define NUM_BULK_TRANSFERS 4
 
@@ -75,11 +70,6 @@
 #define NUM_FB_TRANSFERS  4
 #define NUM_FB_PACKETS    5   // 5 packets = 5 ms (1 packet per ms)
 #define FB_PACKET_SIZE    64
-
-#define NUM_MIDI_IN_TRANSFERS 4
-#define MIDI_IN_BUF_SIZE      64
-#define MIDI_PAD_BYTE         0xFD
-#define MIDI_DELIM_BYTE       0xE0
 
 #define SINK_CHANNELS   4
 #define SOURCE_CHANNELS 16
@@ -250,23 +240,6 @@ static volatile int64_t g_baseline_diff = 0;
 static volatile bool g_baseline_locked = false;
 static volatile uint32_t g_sink_underruns = 0;
 static volatile uint32_t g_sink_overruns = 0;
-
-static snd_seq_t *g_seq_handle = NULL;
-static int g_seq_in_port = -1;
-static int g_seq_out_port = -1;
-static snd_midi_event_t *g_midi_in_coder = NULL;
-static snd_midi_event_t *g_midi_out_coder = NULL;
-static pthread_mutex_t g_seq_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static uint8_t g_midi_in_acc[512];
-static int g_midi_in_acc_len = 0;
-static pthread_mutex_t g_midi_in_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static volatile int g_active_midi_in_transfers = 0;
-static volatile uint64_t g_midi_in_events_count = 0;
-static volatile uint64_t g_midi_out_events_count = 0;
-static pthread_t g_midi_out_thread;
-static bool g_midi_out_thread_running = false;
 
 static void sig_handler(int sig) {
     (void)sig;
@@ -714,177 +687,11 @@ static void LIBUSB_CALL bulk_in_cb(struct libusb_transfer *transfer) {
     }
 }
 
-// ALSA Sequencer initialization for hardware MIDI
-static bool init_alsa_midi(void) {
-    int err = snd_seq_open(&g_seq_handle, "default", SND_SEQ_OPEN_DUPLEX, 0);
-    if (err < 0) {
-        fprintf(stderr, "[WARN] Could not open ALSA Sequencer: %s\n", snd_strerror(err));
-        return false;
-    }
-    snd_seq_set_client_name(g_seq_handle, "TASCAM US-1641");
-    snd_seq_nonblock(g_seq_handle, 1);
-
-    g_seq_in_port = snd_seq_create_simple_port(
-        g_seq_handle,
-        "MIDI In",
-        SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ,
-        SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_HARDWARE | SND_SEQ_PORT_TYPE_PORT
-    );
-
-    g_seq_out_port = snd_seq_create_simple_port(
-        g_seq_handle,
-        "MIDI Out",
-        SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE,
-        SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_HARDWARE | SND_SEQ_PORT_TYPE_PORT
-    );
-
-    snd_midi_event_new(256, &g_midi_in_coder);
-    snd_midi_event_new(256, &g_midi_out_coder);
-    if (g_midi_in_coder) snd_midi_event_init(g_midi_in_coder);
-    if (g_midi_out_coder) snd_midi_event_init(g_midi_out_coder);
-
-    return true;
-}
-
-// Background worker thread for ALSA Sequencer -> US-1641 MIDI OUT (Endpoint 0x04)
-static void *midi_out_worker(void *arg) {
-    (void)arg;
-    if (!g_seq_handle) return NULL;
-
-    int npfds = snd_seq_poll_descriptors_count(g_seq_handle, POLLIN);
-    if (npfds <= 0) return NULL;
-    struct pollfd *pfds = calloc(npfds, sizeof(struct pollfd));
-    if (!pfds) return NULL;
-
-    while (g_running) {
-        snd_seq_poll_descriptors(g_seq_handle, pfds, npfds, POLLIN);
-        int ret = poll(pfds, npfds, 100);
-        if (ret <= 0) continue;
-
-        pthread_mutex_lock(&g_seq_lock);
-        snd_seq_event_t *ev = NULL;
-        while (snd_seq_event_input(g_seq_handle, &ev) >= 0) {
-            if (!ev) break;
-            if (ev->dest.port == g_seq_out_port && g_midi_out_coder && g_handle) {
-                uint8_t raw_buf[128];
-                long bytes = snd_midi_event_decode(g_midi_out_coder, raw_buf, sizeof(raw_buf), ev);
-                if (bytes > 0) {
-                    for (long b = 0; b < bytes; b += 8) {
-                        uint8_t frame[9];
-                        memset(frame, MIDI_PAD_BYTE, 8);
-                        int chunk = (bytes - b < 8) ? (int)(bytes - b) : 8;
-                        memcpy(frame, raw_buf + b, chunk);
-                        frame[8] = MIDI_DELIM_BYTE;
-                        int transferred = 0;
-                        libusb_bulk_transfer(g_handle, EP_MIDI_OUT, frame, 9, &transferred, 50);
-                        g_midi_out_events_count++;
-                    }
-                }
-            }
-        }
-        pthread_mutex_unlock(&g_seq_lock);
-    }
-    free(pfds);
-    return NULL;
-}
-
-// Libusb Bulk IN callback for hardware MIDI Input (Endpoint 0x83)
-static void LIBUSB_CALL midi_in_cb(struct libusb_transfer *transfer) {
-    if (!g_running || transfer->status == LIBUSB_TRANSFER_NO_DEVICE || transfer->status == LIBUSB_TRANSFER_CANCELLED) {
-        if (transfer->status == LIBUSB_TRANSFER_NO_DEVICE) {
-            fprintf(stderr, "[WARN] TASCAM US-1641 disconnected (MIDI IN).\n");
-            g_running = false;
-        }
-        g_active_midi_in_transfers--;
-        return;
-    }
-
-    if (transfer->status == LIBUSB_TRANSFER_COMPLETED && transfer->actual_length > 0) {
-        pthread_mutex_lock(&g_midi_in_lock);
-        if (g_midi_in_acc_len + transfer->actual_length <= (int)sizeof(g_midi_in_acc)) {
-            memcpy(g_midi_in_acc + g_midi_in_acc_len, transfer->buffer, transfer->actual_length);
-            g_midi_in_acc_len += transfer->actual_length;
-        } else {
-            g_midi_in_acc_len = 0;
-        }
-
-        while (g_midi_in_acc_len >= 9) {
-            if (g_midi_in_acc[8] == MIDI_DELIM_BYTE) {
-                for (int i = 0; i < 8; i++) {
-                    uint8_t byte = g_midi_in_acc[i];
-                    if (byte != MIDI_PAD_BYTE && g_midi_in_coder && g_seq_handle) {
-                        snd_seq_event_t ev;
-                        snd_seq_ev_clear(&ev);
-                        int res = snd_midi_event_encode_byte(g_midi_in_coder, byte, &ev);
-                        if (res > 0) {
-                            snd_seq_ev_set_source(&ev, g_seq_in_port);
-                            snd_seq_ev_set_subs(&ev);
-                            snd_seq_ev_set_direct(&ev);
-                            pthread_mutex_lock(&g_seq_lock);
-                            snd_seq_event_output_direct(g_seq_handle, &ev);
-                            pthread_mutex_unlock(&g_seq_lock);
-                            g_midi_in_events_count++;
-                        }
-                    }
-                }
-                memmove(g_midi_in_acc, g_midi_in_acc + 9, g_midi_in_acc_len - 9);
-                g_midi_in_acc_len -= 9;
-            } else {
-                int sync_idx = -1;
-                for (int s = 0; s < g_midi_in_acc_len; s++) {
-                    if (g_midi_in_acc[s] == MIDI_DELIM_BYTE) {
-                        sync_idx = s;
-                        break;
-                    }
-                }
-                if (sync_idx >= 0) {
-                    if (sync_idx >= 8) {
-                        int frame_start = sync_idx - 8;
-                        for (int i = 0; i < 8; i++) {
-                            uint8_t byte = g_midi_in_acc[frame_start + i];
-                            if (byte != MIDI_PAD_BYTE && g_midi_in_coder && g_seq_handle) {
-                                snd_seq_event_t ev;
-                                snd_seq_ev_clear(&ev);
-                                int res = snd_midi_event_encode_byte(g_midi_in_coder, byte, &ev);
-                                if (res > 0) {
-                                    snd_seq_ev_set_source(&ev, g_seq_in_port);
-                                    snd_seq_ev_set_subs(&ev);
-                                    snd_seq_ev_set_direct(&ev);
-                                    pthread_mutex_lock(&g_seq_lock);
-                                    snd_seq_event_output_direct(g_seq_handle, &ev);
-                                    pthread_mutex_unlock(&g_seq_lock);
-                                    g_midi_in_events_count++;
-                                }
-                            }
-                        }
-                    }
-                    memmove(g_midi_in_acc, g_midi_in_acc + sync_idx + 1, g_midi_in_acc_len - (sync_idx + 1));
-                    g_midi_in_acc_len -= (sync_idx + 1);
-                } else {
-                    g_midi_in_acc_len = 0;
-                }
-            }
-        }
-        pthread_mutex_unlock(&g_midi_in_lock);
-    } else if (transfer->status == LIBUSB_TRANSFER_STALL) {
-        libusb_clear_halt(g_handle, EP_MIDI_IN);
-    }
-
-    if (g_running) {
-        int r = libusb_submit_transfer(transfer);
-        if (r < 0) {
-            g_active_midi_in_transfers--;
-        }
-    } else {
-        g_active_midi_in_transfers--;
-    }
-}
-
 // Background thread for isochronous clock & output event handling
 static void *usb_event_worker(void *arg) {
     (void)arg;
     struct timeval tv = {0, 1000};
-    while (g_running || g_active_iso_transfers > 0 || g_active_fb_transfers > 0 || g_active_bulk_transfers > 0 || g_active_midi_in_transfers > 0) {
+    while (g_running || g_active_iso_transfers > 0 || g_active_fb_transfers > 0 || g_active_bulk_transfers > 0) {
         libusb_handle_events_timeout_completed(g_ctx, &tv, NULL);
     }
     return NULL;
@@ -1109,17 +916,9 @@ int main(int argc, char **argv) {
 
     pw_thread_loop_start(pw_tloop);
 
-    if (init_alsa_midi()) {
-        pthread_create(&g_midi_out_thread, NULL, midi_out_worker, NULL);
-        g_midi_out_thread_running = true;
-    }
-
     printf("[SUCCESS] PipeWire Nodes active in sound server at %d Hz!\n", g_config.sample_rate);
     printf("          - Output Node: TASCAM US-1641 Outputs (4 Ch: Main L/R + Line 3/4)\n");
     printf("          - Input Node:  TASCAM US-1641 Inputs  (16 Ch: 8 Mics + 6 Line + S/PDIF)\n");
-    if (g_seq_handle) {
-        printf("          - MIDI Ports:  TASCAM US-1641 MIDI In & MIDI Out (ALSA Seq / PipeWire)\n");
-    }
 
     // Pre-allocate Isochronous OUT transfers (Endpoint 0x02)
     int max_transfer_buf_size = NUM_ISO_PACKETS * 96;
@@ -1169,19 +968,6 @@ int main(int argc, char **argv) {
         libusb_submit_transfer(bulk_xfers[t]);
     }
 
-    // Pre-allocate Bulk IN transfers (Endpoint 0x83) for hardware MIDI Input
-    unsigned char *midi_in_bufs[NUM_MIDI_IN_TRANSFERS];
-    struct libusb_transfer *midi_in_xfers[NUM_MIDI_IN_TRANSFERS];
-
-    for (int t = 0; t < NUM_MIDI_IN_TRANSFERS; t++) {
-        midi_in_bufs[t] = calloc(1, MIDI_IN_BUF_SIZE);
-        midi_in_xfers[t] = libusb_alloc_transfer(0);
-        libusb_fill_bulk_transfer(midi_in_xfers[t], g_handle, EP_MIDI_IN, midi_in_bufs[t],
-                                  MIDI_IN_BUF_SIZE, midi_in_cb, NULL, 0);
-        g_active_midi_in_transfers++;
-        libusb_submit_transfer(midi_in_xfers[t]);
-    }
-
     printf("[RUNNING] Full-Duplex Multi-Track Audio Bridge active! Managing active drift regulation...\n");
 
     char stats_path[512];
@@ -1220,13 +1006,11 @@ int main(int argc, char **argv) {
                         "rate=%d preroll=%d locked=%d hw_err=%ld | "
                         "sink_q=%u sink_r=%.6f sink_act=%d u_runs=%u o_runs=%u | "
                         "src_fps=%u src_q=%u src_r=%.6f src_act=%d src_u=%u src_o=%u | "
-                        "xfers=%d fb_pkts=%lu fb_last=%u | "
-                        "midi_in=%lu midi_out=%lu\n",
+                        "xfers=%d fb_pkts=%lu fb_last=%u\n",
                         g_config.sample_rate, g_config.preroll_frames, (int)g_baseline_locked, hw_err,
                         sink_q, s_sink_ratio, (int)s_sink_active, g_sink_underruns, g_sink_overruns,
                         src_fps, src_q, s_source_ratio, (int)s_source_active, s_source_underruns, s_source_overruns,
-                        g_active_iso_transfers, (unsigned long)g_fb_packets_count, (unsigned int)g_fb_last_val,
-                        (unsigned long)g_midi_in_events_count, (unsigned long)g_midi_out_events_count);
+                        g_active_iso_transfers, (unsigned long)g_fb_packets_count, (unsigned int)g_fb_last_val);
                 fclose(fstats);
             }
 
@@ -1245,17 +1029,7 @@ int main(int argc, char **argv) {
 
     printf("\n[INFO] Draining transfers and stopping PipeWire streams...\n");
 
-    if (g_midi_out_thread_running) {
-        pthread_join(g_midi_out_thread, NULL);
-    }
-
-    for (int t = 0; t < NUM_MIDI_IN_TRANSFERS; t++) {
-        if (midi_in_xfers[t]) {
-            libusb_cancel_transfer(midi_in_xfers[t]);
-        }
-    }
-
-    for (int wait_ms = 0; wait_ms < 500 && (g_active_iso_transfers > 0 || g_active_fb_transfers > 0 || g_active_bulk_transfers > 0 || g_active_midi_in_transfers > 0); wait_ms++) {
+    for (int wait_ms = 0; wait_ms < 500 && (g_active_iso_transfers > 0 || g_active_fb_transfers > 0 || g_active_bulk_transfers > 0); wait_ms++) {
         usleep(1000);
     }
     pthread_join(iso_thread, NULL);
@@ -1271,21 +1045,6 @@ int main(int argc, char **argv) {
     for (int t = 0; t < NUM_BULK_TRANSFERS; t++) {
         libusb_free_transfer(bulk_xfers[t]);
         free(bulk_bufs[t]);
-    }
-    for (int t = 0; t < NUM_MIDI_IN_TRANSFERS; t++) {
-        if (midi_in_xfers[t]) {
-            libusb_free_transfer(midi_in_xfers[t]);
-            free(midi_in_bufs[t]);
-        }
-    }
-
-    if (g_seq_handle) {
-        pthread_mutex_lock(&g_seq_lock);
-        if (g_midi_in_coder) snd_midi_event_free(g_midi_in_coder);
-        if (g_midi_out_coder) snd_midi_event_free(g_midi_out_coder);
-        snd_seq_close(g_seq_handle);
-        g_seq_handle = NULL;
-        pthread_mutex_unlock(&g_seq_lock);
     }
 
     unlink(stats_path);

@@ -24,22 +24,22 @@ echo "================================================================"
 
 # 1. Check build & runtime dependencies
 check_dependencies() {
-    if pkg-config --exists libpipewire-0.3 libusb-1.0 alsa 2>/dev/null && command -v gcc >/dev/null 2>&1; then
-        success "Build dependencies (gcc, libpipewire-0.3, libusb-1.0, alsa) found."
+    if pkg-config --exists libpipewire-0.3 libusb-1.0 2>/dev/null && command -v gcc >/dev/null 2>&1; then
+        success "Build dependencies (gcc, libpipewire-0.3, libusb-1.0) found."
         return 0
     fi
 
     warn "Missing build or runtime dependencies. Attempting to install via system package manager..."
     if command -v apt-get >/dev/null 2>&1; then
         sudo apt-get update
-        sudo apt-get install -y build-essential pkg-config libpipewire-0.3-dev libusb-1.0-0-dev libasound2-dev python3-pyqt6 qpwgraph
+        sudo apt-get install -y build-essential pkg-config libpipewire-0.3-dev libusb-1.0-0-dev python3-pyqt6 qpwgraph
     elif command -v dnf >/dev/null 2>&1; then
-        sudo dnf install -y gcc make pkgconf-pkg-config pipewire-devel libusb1-devel alsa-lib-devel python3-pyqt6 qpwgraph
+        sudo dnf install -y gcc make pkgconf-pkg-config pipewire-devel libusb1-devel python3-pyqt6 qpwgraph
     elif command -v pacman >/dev/null 2>&1; then
-        sudo pacman -S --needed base-devel pkgconf libpipewire libusb alsa-lib python-pyqt6 qpwgraph
+        sudo pacman -S --needed base-devel pkgconf libpipewire libusb python-pyqt6 qpwgraph
     else
         error "Could not detect package manager (apt, dnf, pacman)."
-        error "Please install gcc, pkg-config, libpipewire-0.3-dev, libusb-1.0-0-dev, libasound2-dev, and python3-pyqt6 manually."
+        error "Please install gcc, pkg-config, libpipewire-0.3-dev, libusb-1.0-0-dev, and python3-pyqt6 manually."
         exit 1
     fi
 }
