@@ -4,8 +4,8 @@ CC ?= gcc
 PKG_CONFIG ?= pkg-config
 
 CFLAGS ?= -O2 -Wall -Wextra
-override CFLAGS += -D_GNU_SOURCE -DTASCAMD_VERSION=\"$(VERSION)\" $(shell $(PKG_CONFIG) --cflags libpipewire-0.3 libusb-1.0)
-LDFLAGS += $(shell $(PKG_CONFIG) --libs libpipewire-0.3 libusb-1.0) -lpthread -lm
+override CFLAGS += -D_GNU_SOURCE -DTASCAMD_VERSION=\"$(VERSION)\" $(shell $(PKG_CONFIG) --cflags libpipewire-0.3 libusb-1.0 alsa)
+LDFLAGS += $(shell $(PKG_CONFIG) --libs libpipewire-0.3 libusb-1.0 alsa) -lpthread -lm
 
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
