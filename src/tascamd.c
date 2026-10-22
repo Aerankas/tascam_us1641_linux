@@ -616,7 +616,7 @@ static void LIBUSB_CALL iso_in_fb_cb(struct libusb_transfer *transfer) {
 }
 
 static volatile int g_active_bulk_transfers = 0;
-static int g_global_frame_idx = 0;
+static uint64_t g_global_frame_idx = 0;
 static int16_t g_current_sample[SOURCE_CHANNELS] = {0};
 
 static void LIBUSB_CALL bulk_in_cb(struct libusb_transfer *transfer) {
@@ -652,7 +652,7 @@ static void LIBUSB_CALL bulk_in_cb(struct libusb_transfer *transfer) {
         int num_frames = transfer->actual_length / 32;
 
         for (int f = 0; f < num_frames; f++) {
-            int parity = g_global_frame_idx % 2; // 0 = EVEN, 1 = ODD
+            int parity = (int)(g_global_frame_idx & 1); // 0 = EVEN, 1 = ODD
             g_global_frame_idx++;
 
             const unsigned char *frame = &bulk_buf[f * 32];
@@ -757,6 +757,9 @@ static void get_runtime_file_path(char *out_buf, size_t buf_size, const char *fi
 }
 
 int main(int argc, char **argv) {
+    setlinebuf(stdout);
+    setlinebuf(stderr);
+
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
@@ -973,7 +976,7 @@ int main(int argc, char **argv) {
     get_runtime_file_path(hist_path, sizeof(hist_path), "tascamd_history.csv");
 
     uint64_t last_src_pushed = 0;
-    int loop_ticks = 0;
+    uint64_t loop_ticks = 0;
 
     // Main thread sleeps while background threads and callbacks process transfers
     while (g_running) {
