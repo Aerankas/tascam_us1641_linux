@@ -7,9 +7,11 @@
  * Hardware Specification (USB ID 0644:8017, USB 2.0 High-Speed):
  *   - Playback (EP 0x02 Isochronous OUT): 4 channels, 24-bit packed LE
  *     (Out 1/2 Main L/R + Headphones, Out 3/4 Line Outputs)
- *   - Feedback (EP 0x81 Isochronous IN): 1 ms hardware DAC frame consumption credit
+ *   - Feedback (EP 0x81 Isochronous IN): 1 ms hardware DAC frame consumption token
  *   - Capture  (EP 0x86 Bulk IN): 16 channels (14 analog bitplane-multiplexed
  *     24-bit MSB-first across EVEN/ODD 32-byte frames + 2 S/PDIF channels)
+ *   - MIDI In  (EP 0x83 Bulk IN): 9-byte raw MIDI frames (0xFD pad bytes)
+ *   - MIDI Out (EP 0x04 Bulk OUT): 9-byte raw MIDI frames (0x00 delimiter)
  */
 
 #include <stdio.h>
@@ -21,6 +23,7 @@
 #include <signal.h>
 #include <time.h>
 #include <poll.h>
+#include <math.h>
 #include <pthread.h>
 #include <alsa/asoundlib.h>
 #include <pipewire/pipewire.h>
@@ -84,12 +87,13 @@
 #define SINK_CHANNELS   4
 #define SOURCE_CHANNELS 16
 
+/* Native 32-bit floating point frames for PipeWire DSP integration */
 typedef struct {
-    int16_t ch[SINK_CHANNELS]; // ch[0]=Main L, ch[1]=Main R, ch[2]=Line 3, ch[3]=Line 4
+    float ch[SINK_CHANNELS]; // ch[0]=Main L, ch[1]=Main R, ch[2]=Line 3, ch[3]=Line 4
 } PlaybackFrame;
 
 typedef struct {
-    int16_t ch[SOURCE_CHANNELS]; // ch[0..7]=Mic 1..8, ch[8..13]=Line 9..14, ch[14..15]=S/PDIF
+    float ch[SOURCE_CHANNELS]; // ch[0..7]=Mic 1..8, ch[8..13]=Line 9..14, ch[14..15]=S/PDIF
 } CaptureFrame;
 
 #define RING_FRAMES 16384
@@ -147,29 +151,34 @@ static inline void ring_push_source(CaptureRingBuffer *rb, CaptureFrame f) {
     }
 }
 
-// 44.1 kHz High-Speed USB microframe pacing pattern (220 / 221 samples per 5 ms)
-static const int k_pattern_221[40] = {
-    6, 5, 6, 5, 6, 5, 6, 5, 6, 6, 5, 6, 5, 6, 5, 6, 6, 5, 6, 5,
-    6, 5, 6, 5, 6, 5, 6, 5, 6, 5, 6, 5, 6, 5, 6, 5, 6, 5, 6, 5
-};
-static const int k_pattern_220[40] = {
-    6, 5, 6, 5, 6, 5, 6, 5, 6, 5, 6, 5, 6, 5, 6, 5, 6, 5, 6, 5,
-    6, 5, 6, 5, 6, 5, 6, 5, 6, 5, 6, 5, 6, 5, 6, 5, 6, 5, 6, 5
-};
+/* Direct Hardware Feedback Token FIFO (EP 0x81 -> EP 0x02) */
+#define FB_FIFO_SIZE 256
+#define FB_FIFO_MASK (FB_FIFO_SIZE - 1)
+static volatile uint8_t g_fb_fifo[FB_FIFO_SIZE];
+static volatile uint32_t g_fb_fifo_w = 0;
+static volatile uint32_t g_fb_fifo_r = 0;
 
-// 48.0 kHz High-Speed USB microframe pacing pattern (240 samples per 5 ms = 40 * 6)
-static const int k_pattern_240[40] = {
-    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6
-};
-static const int k_pattern_239[40] = {
-    5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6
-};
-static const int k_pattern_241[40] = {
-    7, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-    6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6
-};
+static inline void fb_fifo_push(uint8_t token) {
+    uint32_t w = g_fb_fifo_w;
+    uint32_t r = g_fb_fifo_r;
+    if (w - r < FB_FIFO_SIZE) {
+        g_fb_fifo[w & FB_FIFO_MASK] = token;
+        __sync_synchronize();
+        g_fb_fifo_w = w + 1;
+    }
+}
+
+static inline uint8_t fb_fifo_pop(uint8_t default_val) {
+    uint32_t w = g_fb_fifo_w;
+    uint32_t r = g_fb_fifo_r;
+    if (w > r) {
+        uint8_t val = g_fb_fifo[r & FB_FIFO_MASK];
+        __sync_synchronize();
+        g_fb_fifo_r = r + 1;
+        return val;
+    }
+    return default_val;
+}
 
 typedef struct {
     int sample_rate;       // 48000 (default) or 44100
@@ -244,10 +253,6 @@ static volatile int g_active_iso_transfers = 0;
 static volatile int g_active_fb_transfers = 0;
 static volatile uint64_t g_fb_packets_count = 0;
 static volatile uint32_t g_fb_last_val = 0;
-static volatile int64_t g_hw_consumed_samples = 0;
-static volatile int64_t g_hw_sent_samples = 0;
-static volatile int64_t g_baseline_diff = 0;
-static volatile bool g_baseline_locked = false;
 static volatile uint32_t g_sink_underruns = 0;
 static volatile uint32_t g_sink_overruns = 0;
 
@@ -273,7 +278,7 @@ static void sig_handler(int sig) {
     g_running = false;
 }
 
-// PipeWire Sink: System Playback Audio -> g_sink_rb
+// PipeWire Sink: System Playback Audio (F32) -> g_sink_rb
 static void on_process_sink(void *userdata) {
     struct pw_stream *stream = userdata;
     struct pw_buffer *b = pw_stream_dequeue_buffer(stream);
@@ -281,7 +286,8 @@ static void on_process_sink(void *userdata) {
 
     struct spa_buffer *buf = b->buffer;
     if (buf->datas[0].data) {
-        const PlaybackFrame *src = (const PlaybackFrame *)buf->datas[0].data;
+        uint32_t offset = buf->datas[0].chunk->offset;
+        const PlaybackFrame *src = (const PlaybackFrame *)((const uint8_t *)buf->datas[0].data + offset);
         uint32_t n_frames = buf->datas[0].chunk->size / sizeof(PlaybackFrame);
 
         for (uint32_t i = 0; i < n_frames; i++) {
@@ -292,14 +298,12 @@ static void on_process_sink(void *userdata) {
 }
 
 static volatile bool s_source_active = false;
-static uint64_t s_source_phase = 0; // 32.32 fixed-point phase accumulator
 static volatile double s_source_ratio = 1.0;
-static uint64_t s_source_step = 4294967296ULL;
-static uint32_t s_source_counter = 0;
+static float s_source_q_filtered = 4096.0f;
 static volatile uint32_t s_source_underruns = 0;
 static volatile uint32_t s_source_overruns = 0;
 
-// PipeWire Source: g_source_rb -> System Capture / DAW
+// PipeWire Source: g_source_rb -> System Capture / DAW (Bit-Perfect Native F32)
 static void on_process_source(void *userdata) {
     struct pw_stream *stream = userdata;
     struct pw_buffer *b = pw_stream_dequeue_buffer(stream);
@@ -317,7 +321,7 @@ static void on_process_source(void *userdata) {
 
         // Pre-roll buffering: hold silence until ring buffer reaches target watermark
         if (!s_source_active) {
-            if (queued < (uint32_t)s_source_target_buffer) {
+            if (queued < (uint32_t)s_source_target_buffer + (n_frames / 2)) {
                 memset(dest, 0, n_frames * sizeof(CaptureFrame));
                 buf->datas[0].chunk->offset = 0;
                 buf->datas[0].chunk->size = n_frames * sizeof(CaptureFrame);
@@ -325,71 +329,52 @@ static void on_process_source(void *userdata) {
                 pw_stream_queue_buffer(stream, b);
                 return;
             }
-            // Latch at exact target buffer to eliminate stale latency
-            g_source_rb.read_idx = g_source_rb.write_idx - s_source_target_buffer;
+            // Center quantum oscillation symmetrically around s_source_target_buffer
+            g_source_rb.read_idx = g_source_rb.write_idx - s_source_target_buffer - (n_frames / 2);
             s_source_active = true;
-            s_source_phase = 0;
-            s_source_ratio = 1.0;
-            s_source_step = 4294967296ULL;
+            s_source_q_filtered = (float)s_source_target_buffer;
         }
+
+        // Low-pass filter queue depth across quantums to reject PipeWire quantum sawtooth
+        s_source_q_filtered = 0.99f * s_source_q_filtered + 0.01f * (float)(queued - (n_frames / 2));
 
         // Emergency overrun protection (e.g. system wake from suspend)
         if (queued > 12000) {
-            g_source_rb.read_idx = g_source_rb.write_idx - s_source_target_buffer;
-            queued = s_source_target_buffer;
-            s_source_phase = 0;
+            g_source_rb.read_idx = g_source_rb.write_idx - s_source_target_buffer - (n_frames / 2);
+            queued = s_source_target_buffer + (n_frames / 2);
+            s_source_q_filtered = (float)s_source_target_buffer;
             s_source_overruns++;
         }
 
-        // Smooth proportional rate steering to keep PipeWire capture centered around s_source_target_buffer
-        s_source_counter++;
-        if (s_source_counter % 50 == 0) { // roughly once per second
-            int32_t diff = (int32_t)queued - s_source_target_buffer;
-            double ratio = 1.0;
-            if (diff > 300) {
-                ratio = 1.0 + (double)(diff - 300) * 0.000001;
-            } else if (diff < -300) {
-                ratio = 1.0 + (double)(diff + 300) * 0.000001;
-            }
-            if (ratio > 1.005) ratio = 1.005;
-            if (ratio < 0.995) ratio = 0.995;
-            s_source_ratio = ratio;
-            s_source_step = (uint64_t)(ratio * 4294967296.0 + 0.5);
+        // Wide-deadband filtered drift steering: 0 slips during normal operation,
+        // only nudging 1 sample at a zero-crossing if long-term average drifts > 1024 frames
+        int slip = 0;
+        if (s_source_q_filtered > (float)(s_source_target_buffer + 1024)) {
+            slip = 1; // drop 1 frame to catch up
+            s_source_q_filtered -= 1.0f;
+        } else if (s_source_q_filtered < (float)(s_source_target_buffer - 1024)) {
+            slip = -1; // duplicate 1 frame to let queue accumulate
+            s_source_q_filtered += 1.0f;
         }
-
-        uint64_t step = s_source_step;
 
         for (uint32_t i = 0; i < n_frames; i++) {
             uint32_t avail = ring_avail_read_source(&g_source_rb);
-            if (avail < 2) {
-                // Buffer underrun: hold last frame rather than harsh silence drop
-                if (avail == 1) {
-                    dest[i] = g_source_rb.frames[g_source_rb.read_idx & RING_MASK];
-                } else {
-                    memset(&dest[i], 0, sizeof(CaptureFrame));
-                }
+            if (avail == 0) {
+                memset(&dest[i], 0, sizeof(CaptureFrame));
                 s_source_underruns++;
                 continue;
             }
 
-            uint32_t r_idx = g_source_rb.read_idx;
-            CaptureFrame f0 = g_source_rb.frames[r_idx & RING_MASK];
-            CaptureFrame f1 = g_source_rb.frames[(r_idx + 1) & RING_MASK];
+            dest[i] = g_source_rb.frames[g_source_rb.read_idx & RING_MASK];
+            g_source_rb.read_idx++;
 
-            uint32_t frac_32 = (uint32_t)(s_source_phase & 0xFFFFFFFFULL);
-
-            // Interpolate across all 16 channels
-            for (int c = 0; c < SOURCE_CHANNELS; c++) {
-                int32_t interp = (int32_t)f0.ch[c] + (int32_t)(((int64_t)(f1.ch[c] - f0.ch[c]) * (int64_t)frac_32) >> 32);
-                dest[i].ch[c] = (int16_t)interp;
-            }
-
-            s_source_phase += step;
-            uint32_t advance = (uint32_t)(s_source_phase >> 32);
-            if (advance > 0) {
-                s_source_phase &= 0xFFFFFFFFULL;
-                __sync_synchronize();
-                g_source_rb.read_idx += advance;
+            if (i == 0 && slip != 0) {
+                if (slip == 1 && ring_avail_read_source(&g_source_rb) > 0) {
+                    g_source_rb.read_idx++;
+                } else if (slip == -1) {
+                    g_source_rb.read_idx--;
+                }
+                slip = 0;
             }
         }
 
@@ -411,177 +396,150 @@ static const struct pw_stream_events source_events = {
 };
 
 static volatile bool s_sink_active = false;
-static uint64_t s_sink_phase = 0; // 32.32 fixed-point phase accumulator
 static volatile double s_sink_ratio = 1.0;
-static uint64_t s_sink_step = 4294967296ULL;
 static uint32_t s_microframe_counter = 0;
+static float s_sink_q_filtered = 2048.0f;
+static uint32_t s_sink_underrun_streak = 0;
 
-// Fill contiguous memory with audio from g_sink_rb using smooth fractional linear resampling
+static inline int32_t float_to_s24(float s) {
+    if (s > 1.0f) s = 1.0f;
+    else if (s < -1.0f) s = -1.0f;
+    int32_t val = (int32_t)lrintf(s * 8388607.0f);
+    if (val > 8388607) val = 8388607;
+    else if (val < -8388608) val = -8388608;
+    return val;
+}
+
+// Fill contiguous memory with audio from g_sink_rb using bit-perfect 24-bit PCM conversion
 static void fill_audio_packet(unsigned char *buf, int num_samples) {
     uint32_t queued = ring_avail_read_sink(&g_sink_rb);
     s_microframe_counter++;
 
     // If inactive, wait until buffer accumulates at least s_sink_target_buffer frames
     if (!s_sink_active) {
-        if (queued < (uint32_t)s_sink_target_buffer) {
+        if (queued < (uint32_t)s_sink_target_buffer + 512) {
             memset(buf, 0, num_samples * 12);
             return;
         }
+        // Center quantum oscillation symmetrically around s_sink_target_buffer
+        g_sink_rb.read_idx = g_sink_rb.write_idx - s_sink_target_buffer - 512;
         s_sink_active = true;
-        s_sink_phase = 0;
-        s_sink_ratio = 1.0;
-        s_sink_step = 4294967296ULL;
+        s_sink_underrun_streak = 0;
+        s_sink_q_filtered = (float)s_sink_target_buffer;
     }
+
+    // Low-pass filter the queue level (EMA filter) to reject PipeWire quantum burst jitter
+    s_sink_q_filtered = 0.9995f * s_sink_q_filtered + 0.0005f * (float)queued;
 
     // Emergency overrun protection (e.g. system wake from suspend)
     if (queued > 12000) {
-        g_sink_rb.read_idx = g_sink_rb.write_idx - s_sink_target_buffer;
-        queued = s_sink_target_buffer;
-        s_sink_phase = 0;
+        g_sink_rb.read_idx = g_sink_rb.write_idx - s_sink_target_buffer - 512;
+        queued = s_sink_target_buffer + 512;
+        s_sink_q_filtered = (float)s_sink_target_buffer;
         g_sink_overruns++;
     }
 
-    // Smooth proportional rate steering to keep PipeWire ring buffer centered around s_sink_target_buffer
-    if (s_microframe_counter % 8000 == 0) { // once per second
-        int32_t diff = (int32_t)queued - s_sink_target_buffer;
-        double ratio = 1.0;
-        if (diff > 400) {
-            ratio = 1.0 + (double)(diff - 400) * 0.000001;
-        } else if (diff < -400) {
-            ratio = 1.0 + (double)(diff + 400) * 0.000001;
+    // Wide-deadband filtered drift steering:
+    // Checks filtered average queue (not raw quantum-sawtoothed queued!) with a +-1024 frame deadband.
+    // Guarantees 0 sample slips during normal playback while preventing multi-hour crystal drift.
+    int slip = 0;
+    if (s_microframe_counter % 800 == 0) { // check every 100 ms (10 Hz max rate)
+        if (s_sink_q_filtered > (float)(s_sink_target_buffer + 1024)) {
+            slip = 1; // drop 1 frame to let queue drain towards target
+            s_sink_q_filtered -= 1.0f;
+        } else if (s_sink_q_filtered < (float)(s_sink_target_buffer - 1024)) {
+            slip = -1; // repeat 1 frame to gently build queue towards target
+            s_sink_q_filtered += 1.0f;
         }
-        if (ratio > 1.005) ratio = 1.005;
-        if (ratio < 0.995) ratio = 0.995;
-        s_sink_ratio = ratio;
-        s_sink_step = (uint64_t)(ratio * 4294967296.0 + 0.5);
     }
-
-    uint64_t step = s_sink_step;
 
     for (int s = 0; s < num_samples; s++) {
         uint32_t avail = ring_avail_read_sink(&g_sink_rb);
-        if (avail < 2) {
-            // Buffer underrun: fill remaining microframe with silence and re-enter preroll wait
-            memset(&buf[s * 12], 0, (num_samples - s) * 12);
-            s_sink_active = false;
-            g_sink_underruns++;
-            break;
+        if (avail == 0) {
+            memset(&buf[s * 12], 0, 12);
+            s_sink_underrun_streak++;
+            if (s_sink_underrun_streak >= 240) { // ~5 ms of sustained silence (stream paused/stopped)
+                if (s_sink_active) {
+                    s_sink_active = false; // clean drop back to pre-roll wait
+                }
+                s_sink_underrun_streak = 0;
+                s_sink_q_filtered = (float)s_sink_target_buffer;
+            } else {
+                g_sink_underruns++;
+            }
+            continue;
         }
 
-        uint32_t r_idx = g_sink_rb.read_idx;
-        PlaybackFrame f0 = g_sink_rb.frames[r_idx & RING_MASK];
-        PlaybackFrame f1 = g_sink_rb.frames[(r_idx + 1) & RING_MASK];
+        s_sink_underrun_streak = 0;
+        PlaybackFrame f = g_sink_rb.frames[g_sink_rb.read_idx & RING_MASK];
+        g_sink_rb.read_idx++;
 
-        uint32_t frac_32 = (uint32_t)(s_sink_phase & 0xFFFFFFFFULL);
+        if (s == 0 && slip != 0) {
+            if (slip == 1 && ring_avail_read_sink(&g_sink_rb) > 0) {
+                g_sink_rb.read_idx++;
+            } else if (slip == -1) {
+                g_sink_rb.read_idx--;
+            }
+            slip = 0;
+        }
 
-        // Smooth linear interpolation across all 4 channels
-        int32_t interp[4];
+        // Bit-perfect 24-bit PCM conversion across all 3 bytes LE per channel
         for (int c = 0; c < 4; c++) {
-            interp[c] = (int32_t)f0.ch[c] + (int32_t)(((int64_t)(f1.ch[c] - f0.ch[c]) * (int64_t)frac_32) >> 32);
-        }
-
-        int32_t s24_0 = interp[0] << 8;
-        int32_t s24_1 = interp[1] << 8;
-        int32_t s24_2 = interp[2] << 8;
-        int32_t s24_3 = interp[3] << 8;
-
-        // Ch 1 (Left: Output 1 / Headphone L) - 24-bit LE
-        buf[s * 12 + 0] = (unsigned char)(s24_0 & 0xFF);
-        buf[s * 12 + 1] = (unsigned char)((s24_0 >> 8) & 0xFF);
-        buf[s * 12 + 2] = (unsigned char)((s24_0 >> 16) & 0xFF);
-
-        // Ch 2 (Right: Output 2 / Headphone R) - 24-bit LE
-        buf[s * 12 + 3] = (unsigned char)(s24_1 & 0xFF);
-        buf[s * 12 + 4] = (unsigned char)((s24_1 >> 8) & 0xFF);
-        buf[s * 12 + 5] = (unsigned char)((s24_1 >> 16) & 0xFF);
-
-        // Ch 3 (Line Out 3) - 24-bit LE
-        buf[s * 12 + 6] = (unsigned char)(s24_2 & 0xFF);
-        buf[s * 12 + 7] = (unsigned char)((s24_2 >> 8) & 0xFF);
-        buf[s * 12 + 8] = (unsigned char)((s24_2 >> 16) & 0xFF);
-
-        // Ch 4 (Line Out 4) - 24-bit LE
-        buf[s * 12 + 9]  = (unsigned char)(s24_3 & 0xFF);
-        buf[s * 12 + 10] = (unsigned char)((s24_3 >> 8) & 0xFF);
-        buf[s * 12 + 11] = (unsigned char)((s24_3 >> 16) & 0xFF);
-
-        // Advance fractional phase and commit read index
-        s_sink_phase += step;
-        uint32_t advance = (uint32_t)(s_sink_phase >> 32);
-        if (advance > 0) {
-            s_sink_phase &= 0xFFFFFFFFULL;
-            __sync_synchronize();
-            g_sink_rb.read_idx += advance;
+            int32_t s24 = float_to_s24(f.ch[c]);
+            buf[s * 12 + c * 3 + 0] = (unsigned char)(s24 & 0xFF);
+            buf[s * 12 + c * 3 + 1] = (unsigned char)((s24 >> 8) & 0xFF);
+            buf[s * 12 + c * 3 + 2] = (unsigned char)((s24 >> 16) & 0xFF);
         }
     }
 }
 
 static void prepare_iso_transfer_buffer(struct libusb_transfer *transfer) {
-    // Closed-loop hardware rate pacing:
-    // Follow the TASCAM hardware DAC's feedback tokens from EP 0x81
-    int send_samples = (g_config.sample_rate == 48000) ? 240 : 220;
-    const int *pattern = (g_config.sample_rate == 48000) ? k_pattern_240 : k_pattern_220;
-
-    if (g_config.sample_rate == 48000) {
-        if (g_fb_packets_count > 50) {
-            if (!g_baseline_locked) {
-                g_baseline_diff = g_hw_sent_samples - g_hw_consumed_samples;
-                g_baseline_locked = true;
-            }
-            int64_t err = g_hw_sent_samples - g_hw_consumed_samples - g_baseline_diff;
-            if (err > 400) {
-                send_samples = 239;
-                pattern = k_pattern_239;
-                if (err > 1000) g_baseline_diff = g_hw_sent_samples - g_hw_consumed_samples;
-            } else if (err < -400) {
-                send_samples = 241;
-                pattern = k_pattern_241;
-                if (err < -1000) g_baseline_diff = g_hw_sent_samples - g_hw_consumed_samples;
-            } else if (err > 0) {
-                send_samples = 239;
-                pattern = k_pattern_239;
-            } else {
-                send_samples = 241;
-                pattern = k_pattern_241;
-            }
-        } else {
-            send_samples = 240;
-            pattern = k_pattern_240;
-        }
-    } else {
-        if (g_fb_packets_count > 50) {
-            if (!g_baseline_locked) {
-                g_baseline_diff = g_hw_sent_samples - g_hw_consumed_samples;
-                g_baseline_locked = true;
-            }
-            int64_t err = g_hw_sent_samples - g_hw_consumed_samples - g_baseline_diff;
-            if (err > 400) {
-                send_samples = 220;
-                if (err > 1000) g_baseline_diff = g_hw_sent_samples - g_hw_consumed_samples;
-            } else if (err < -400) {
-                send_samples = 221;
-                if (err < -1000) g_baseline_diff = g_hw_sent_samples - g_hw_consumed_samples;
-            } else if (err > 0) {
-                send_samples = 220;
-            } else {
-                send_samples = 221;
-            }
-        } else {
-            send_samples = (g_urb_counter % 2 == 0) ? 220 : 221;
-        }
-        pattern = (send_samples == 221) ? k_pattern_221 : k_pattern_220;
-    }
-    __sync_fetch_and_add(&g_hw_sent_samples, send_samples);
-    g_urb_counter++;
-
     unsigned char *p = transfer->buffer;
-    for (int i = 0; i < NUM_ISO_PACKETS; i++) {
-        int samples = pattern[i];
-        int pkt_len = samples * 12;
+    uint32_t urb = g_urb_counter++;
 
-        fill_audio_packet(p, samples);
-        transfer->iso_packet_desc[i].length = pkt_len;
-        p += pkt_len;
+    for (int m = 0; m < 5; m++) {
+        uint8_t def_val;
+        if (g_config.sample_rate == 48000) {
+            def_val = 48;
+        } else {
+            // Nominal 44.1 kHz pattern: 44, 44, 44, 44, 45 (1 out of 10 ms is 45)
+            uint32_t ms_idx = urb * 5 + m;
+            def_val = (ms_idx % 10 == 9) ? 45 : 44;
+        }
+
+        uint8_t n_samples = fb_fifo_pop(def_val);
+        if (n_samples < 40 || n_samples > 55) n_samples = def_val;
+
+        int pat8[8];
+        if (g_config.sample_rate == 48000) {
+            // Nominal 48 samples = 6 samples per microframe
+            // Deviations: microframe 0 absorbs the delta (+1 -> 7, -1 -> 5)
+            int delta = (int)n_samples - 48;
+            pat8[0] = 6 + delta;
+            for (int u = 1; u < 8; u++) pat8[u] = 6;
+        } else {
+            // 44.1 kHz
+            if (n_samples == 44) {
+                for (int u = 0; u < 8; u++) pat8[u] = (u % 2 == 0) ? 6 : 5;
+            } else if (n_samples == 45) {
+                static const int k_45[8] = {6, 6, 5, 6, 5, 6, 5, 6};
+                for (int u = 0; u < 8; u++) pat8[u] = k_45[u];
+            } else {
+                int delta = (int)n_samples - 44;
+                for (int u = 0; u < 8; u++) pat8[u] = (u % 2 == 0) ? 6 : 5;
+                pat8[0] += delta;
+            }
+        }
+
+        for (int u = 0; u < 8; u++) {
+            int pkt_idx = m * 8 + u;
+            int samples = pat8[u];
+            int pkt_len = samples * 12;
+
+            fill_audio_packet(p, samples);
+            transfer->iso_packet_desc[pkt_idx].length = pkt_len;
+            p += pkt_len;
+        }
     }
     transfer->length = (int)(p - transfer->buffer);
 }
@@ -608,7 +566,7 @@ static void LIBUSB_CALL iso_out_cb(struct libusb_transfer *transfer) {
 }
 
 // Isochronous Feedback IN callback (Endpoint 0x81):
-// Reads hardware DAC sample consumption tokens and updates cumulative sample counter
+// Receives explicit 1ms hardware DAC buffer tokens and pushes to fb_fifo
 static void LIBUSB_CALL iso_in_fb_cb(struct libusb_transfer *transfer) {
     if (!g_running || transfer->status == LIBUSB_TRANSFER_NO_DEVICE) {
         if (transfer->status == LIBUSB_TRANSFER_NO_DEVICE) {
@@ -623,8 +581,8 @@ static void LIBUSB_CALL iso_in_fb_cb(struct libusb_transfer *transfer) {
                 transfer->iso_packet_desc[i].actual_length > 0) {
                 unsigned char *p = transfer->buffer + (i * FB_PACKET_SIZE);
                 int val = p[0];
-                if (val >= 35 && val <= 55) {
-                    __sync_fetch_and_add(&g_hw_consumed_samples, val);
+                if (val >= 40 && val <= 55) {
+                    fb_fifo_push((uint8_t)val);
                     g_fb_last_val = val;
                     g_fb_packets_count++;
                 }
@@ -644,7 +602,7 @@ static void LIBUSB_CALL iso_in_fb_cb(struct libusb_transfer *transfer) {
 
 static volatile int g_active_bulk_transfers = 0;
 static uint64_t g_global_frame_idx = 0;
-static int16_t g_current_sample[SOURCE_CHANNELS] = {0};
+static float g_current_sample[SOURCE_CHANNELS] = {0.0f};
 
 static void LIBUSB_CALL bulk_in_cb(struct libusb_transfer *transfer) {
     if (!g_running || transfer->status == LIBUSB_TRANSFER_NO_DEVICE) {
@@ -679,12 +637,12 @@ static void LIBUSB_CALL bulk_in_cb(struct libusb_transfer *transfer) {
         int num_frames = transfer->actual_length / 32;
 
         for (int f = 0; f < num_frames; f++) {
+            const unsigned char *frame = &bulk_buf[f * 32];
             int parity = (int)(g_global_frame_idx & 1); // 0 = EVEN, 1 = ODD
             g_global_frame_idx++;
 
-            const unsigned char *frame = &bulk_buf[f * 32];
-
-            // Demux 7 channels from this 32-byte frame
+            // Demux 7 channels from this 32-byte frame directly to full 24-bit resolution
+            // Hardware framing: parity 0 = top row (In 1, 3, 5, 7, 9, 11, 13), parity 1 = bottom row (In 2, 4, 6, 8, 10, 12, 14)
             for (int b = 0; b < 7; b++) {
                 int ch_idx = (parity == 0) ? (2 * b) : (2 * b + 1); // 0-based channel index (0..13)
 
@@ -694,8 +652,7 @@ static void LIBUSB_CALL bulk_in_cb(struct libusb_transfer *transfer) {
                     val = (val << 1) | bit_val;
                 }
                 if (val & 0x800000) val -= 0x1000000;
-                int16_t s16 = (int16_t)(val >> 8);
-                g_current_sample[ch_idx] = s16;
+                g_current_sample[ch_idx] = (float)val * (1.0f / 8388608.0f);
             }
 
             // On completion of ODD frame, all 14 analog channels are sampled
@@ -907,8 +864,8 @@ static bool init_tascam_hardware(void) {
 
     libusb_control_transfer(g_handle, 0x22, 0x01, 0x0100, 0x0086, rate_data, 3, 1000);
     libusb_control_transfer(g_handle, 0x22, 0x01, 0x0100, 0x0002, rate_data, 3, 1000);
-
     libusb_control_transfer(g_handle, 0x40, 0x49, 0x0032, 0x0000, NULL, 0, 1000);
+
     return true;
 }
 
@@ -989,7 +946,7 @@ int main(int argc, char **argv) {
     struct spa_hook source_listener;
     memset(&source_listener, 0, sizeof(source_listener));
 
-    // 1. Create Playback Sink (Headphones / Main Out + Line Out 3/4)
+    // 1. Create Playback Sink (Headphones / Main Out + Line Out 3/4) - Native F32
     struct pw_properties *sink_props = pw_properties_new(
         PW_KEY_MEDIA_TYPE, "Audio",
         PW_KEY_MEDIA_CATEGORY, "Playback",
@@ -998,6 +955,7 @@ int main(int argc, char **argv) {
         PW_KEY_NODE_DESCRIPTION, "TASCAM US-1641 Outputs",
         PW_KEY_NODE_NICK, "US-1641 Out",
         PW_KEY_AUDIO_CHANNELS, "4",
+        "audio.position", "[ FL, FR, RL, RR ]",
         PW_KEY_AUDIO_RATE, rate_str,
         PW_KEY_NODE_DEVICE_PORT_NAME_PREFIX, "",
         PW_KEY_NODE_CHANNELNAMES, "[ \"Out 1 (Main L - Phones)\", \"Out 2 (Main R - Phones)\", \"Out 3 (Line Out 3)\", \"Out 4 (Line Out 4)\" ]",
@@ -1012,7 +970,7 @@ int main(int argc, char **argv) {
     uint8_t sink_buf[4096];
     struct spa_pod_builder b1 = SPA_POD_BUILDER_INIT(sink_buf, sizeof(sink_buf));
     struct spa_audio_info_raw info_sink = {
-        .format = SPA_AUDIO_FORMAT_S16_LE,
+        .format = SPA_AUDIO_FORMAT_F32_LE,
         .channels = SINK_CHANNELS,
         .rate = g_config.sample_rate,
         .position = {
@@ -1028,7 +986,7 @@ int main(int argc, char **argv) {
                       PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS,
                       params_sink, 1);
 
-    // 2. Create Capture Source (8 Mics + 6 Line Ins + S/PDIF)
+    // 2. Create Capture Source (8 Mics + 6 Line Ins + S/PDIF) - Native F32
     struct pw_properties *source_props = pw_properties_new(
         PW_KEY_MEDIA_TYPE, "Audio",
         PW_KEY_MEDIA_CATEGORY, "Capture",
@@ -1037,6 +995,8 @@ int main(int argc, char **argv) {
         PW_KEY_NODE_DESCRIPTION, "TASCAM US-1641 Inputs",
         PW_KEY_NODE_NICK, "US-1641 In",
         PW_KEY_AUDIO_CHANNELS, "16",
+        "audio.position", "[ AUX0, AUX1, AUX2, AUX3, AUX4, AUX5, AUX6, AUX7, AUX8, AUX9, AUX10, AUX11, AUX12, AUX13, AUX14, AUX15 ]",
+        "channelmix.disable", "true",
         PW_KEY_AUDIO_RATE, rate_str,
         PW_KEY_NODE_DEVICE_PORT_NAME_PREFIX, "",
         PW_KEY_NODE_CHANNELNAMES, "[ \"In 01 (Mic 1)\", \"In 02 (Mic 2)\", \"In 03 (Mic 3)\", \"In 04 (Mic 4)\", \"In 05 (Mic 5)\", \"In 06 (Mic 6)\", \"In 07 (Mic 7)\", \"In 08 (Mic 8)\", \"In 09 (Line 9)\", \"In 10 (Line 10)\", \"In 11 (Line 11)\", \"In 12 (Line 12)\", \"In 13 (Line 13)\", \"In 14 (Line 14)\", \"In 15 (SPDIF L)\", \"In 16 (SPDIF R)\" ]",
@@ -1051,26 +1011,26 @@ int main(int argc, char **argv) {
     uint8_t source_buf[4096];
     struct spa_pod_builder b2 = SPA_POD_BUILDER_INIT(source_buf, sizeof(source_buf));
     struct spa_audio_info_raw info_source = {
-        .format = SPA_AUDIO_FORMAT_S16_LE,
+        .format = SPA_AUDIO_FORMAT_F32_LE,
         .channels = SOURCE_CHANNELS,
         .rate = g_config.sample_rate,
         .position = {
-            SPA_AUDIO_CHANNEL_FL,    // Ch 1 (Mic 1)
-            SPA_AUDIO_CHANNEL_FR,    // Ch 2 (Mic 2)
-            SPA_AUDIO_CHANNEL_AUX0,  // Ch 3 (Mic 3)
-            SPA_AUDIO_CHANNEL_AUX1,  // Ch 4 (Mic 4)
-            SPA_AUDIO_CHANNEL_AUX2,  // Ch 5 (Mic 5)
-            SPA_AUDIO_CHANNEL_AUX3,  // Ch 6 (Mic 6)
-            SPA_AUDIO_CHANNEL_AUX4,  // Ch 7 (Mic 7)
-            SPA_AUDIO_CHANNEL_AUX5,  // Ch 8 (Mic 8)
-            SPA_AUDIO_CHANNEL_AUX6,  // Ch 9 (Line In 9)
-            SPA_AUDIO_CHANNEL_AUX7,  // Ch 10 (Line In 10)
-            SPA_AUDIO_CHANNEL_AUX8,  // Ch 11 (Line In 11)
-            SPA_AUDIO_CHANNEL_AUX9,  // Ch 12 (Line In 12)
-            SPA_AUDIO_CHANNEL_AUX10, // Ch 13 (Line In 13)
-            SPA_AUDIO_CHANNEL_AUX11, // Ch 14 (Line In 14)
-            SPA_AUDIO_CHANNEL_AUX12, // Ch 15 (S/PDIF L)
-            SPA_AUDIO_CHANNEL_AUX13  // Ch 16 (S/PDIF R)
+            SPA_AUDIO_CHANNEL_AUX0,  // Ch 1 (Mic 1)
+            SPA_AUDIO_CHANNEL_AUX1,  // Ch 2 (Mic 2)
+            SPA_AUDIO_CHANNEL_AUX2,  // Ch 3 (Mic 3)
+            SPA_AUDIO_CHANNEL_AUX3,  // Ch 4 (Mic 4)
+            SPA_AUDIO_CHANNEL_AUX4,  // Ch 5 (Mic 5)
+            SPA_AUDIO_CHANNEL_AUX5,  // Ch 6 (Mic 6)
+            SPA_AUDIO_CHANNEL_AUX6,  // Ch 7 (Mic 7)
+            SPA_AUDIO_CHANNEL_AUX7,  // Ch 8 (Mic 8)
+            SPA_AUDIO_CHANNEL_AUX8,  // Ch 9 (Line In 9)
+            SPA_AUDIO_CHANNEL_AUX9,  // Ch 10 (Line In 10)
+            SPA_AUDIO_CHANNEL_AUX10, // Ch 11 (Line In 11)
+            SPA_AUDIO_CHANNEL_AUX11, // Ch 12 (Line In 12)
+            SPA_AUDIO_CHANNEL_AUX12, // Ch 13 (Line In 13)
+            SPA_AUDIO_CHANNEL_AUX13, // Ch 14 (Line In 14)
+            SPA_AUDIO_CHANNEL_AUX14, // Ch 15 (S/PDIF L)
+            SPA_AUDIO_CHANNEL_AUX15  // Ch 16 (S/PDIF R)
         }
     };
     const struct spa_pod *params_source[1];
@@ -1086,26 +1046,11 @@ int main(int argc, char **argv) {
         g_midi_out_thread_running = true;
     }
 
-    printf("[SUCCESS] PipeWire Nodes active in sound server at %d Hz!\n", g_config.sample_rate);
+    printf("[SUCCESS] PipeWire Nodes active in sound server at %d Hz (Native 32-bit Float)!\n", g_config.sample_rate);
     printf("          - Output Node: TASCAM US-1641 Outputs (4 Ch: Main L/R + Line 3/4)\n");
     printf("          - Input Node:  TASCAM US-1641 Inputs  (16 Ch: 8 Mics + 6 Line + S/PDIF)\n");
     if (g_seq_handle) {
         printf("          - MIDI Ports:  TASCAM US-1641 MIDI In & MIDI Out (ALSA Seq / PipeWire)\n");
-    }
-
-    // Pre-allocate Isochronous OUT transfers (Endpoint 0x02)
-    int max_transfer_buf_size = NUM_ISO_PACKETS * 96;
-    unsigned char *iso_bufs[NUM_ISO_TRANSFERS];
-    struct libusb_transfer *iso_xfers[NUM_ISO_TRANSFERS];
-
-    for (int t = 0; t < NUM_ISO_TRANSFERS; t++) {
-        iso_bufs[t] = calloc(1, max_transfer_buf_size);
-        iso_xfers[t] = libusb_alloc_transfer(NUM_ISO_PACKETS);
-        libusb_fill_iso_transfer(iso_xfers[t], g_handle, EP_ISO_OUT, iso_bufs[t], max_transfer_buf_size,
-                                NUM_ISO_PACKETS, iso_out_cb, NULL, 1000);
-        prepare_iso_transfer_buffer(iso_xfers[t]);
-        g_active_iso_transfers++;
-        libusb_submit_transfer(iso_xfers[t]);
     }
 
     // Pre-allocate Isochronous Feedback IN transfers (Endpoint 0x81)
@@ -1123,6 +1068,21 @@ int main(int argc, char **argv) {
         }
         g_active_fb_transfers++;
         libusb_submit_transfer(fb_xfers[t]);
+    }
+
+    // Pre-allocate Isochronous OUT transfers (Endpoint 0x02)
+    int max_transfer_buf_size = NUM_ISO_PACKETS * 96;
+    unsigned char *iso_bufs[NUM_ISO_TRANSFERS];
+    struct libusb_transfer *iso_xfers[NUM_ISO_TRANSFERS];
+
+    for (int t = 0; t < NUM_ISO_TRANSFERS; t++) {
+        iso_bufs[t] = calloc(1, max_transfer_buf_size);
+        iso_xfers[t] = libusb_alloc_transfer(NUM_ISO_PACKETS);
+        libusb_fill_iso_transfer(iso_xfers[t], g_handle, EP_ISO_OUT, iso_bufs[t], max_transfer_buf_size,
+                                NUM_ISO_PACKETS, iso_out_cb, NULL, 1000);
+        prepare_iso_transfer_buffer(iso_xfers[t]);
+        g_active_iso_transfers++;
+        libusb_submit_transfer(iso_xfers[t]);
     }
 
     pthread_t iso_thread;
@@ -1162,7 +1122,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf("[RUNNING] Full-Duplex Multi-Track Audio Bridge active! Managing active drift regulation...\n");
+    printf("[RUNNING] Full-Duplex Multi-Track Audio Bridge active! Managing closed-loop hardware pacing...\n");
 
     char stats_path[512];
     char hist_path[512];
@@ -1192,7 +1152,8 @@ int main(int argc, char **argv) {
 
             uint32_t sink_q = ring_avail_read_sink(&g_sink_rb);
             uint32_t src_q = ring_avail_read_source(&g_source_rb);
-            long hw_err = g_baseline_locked ? (long)(g_hw_sent_samples - g_hw_consumed_samples - g_baseline_diff) : 0;
+            long q_diff = s_sink_active ? (long)(s_sink_q_filtered - (float)s_sink_target_buffer) : 0;
+            int locked = (g_fb_packets_count > 10) ? 1 : 0;
 
             FILE *fstats = fopen(stats_path, "w");
             if (fstats) {
@@ -1202,7 +1163,7 @@ int main(int argc, char **argv) {
                         "src_fps=%u src_q=%u src_r=%.6f src_act=%d src_u=%u src_o=%u | "
                         "xfers=%d fb_pkts=%lu fb_last=%u | "
                         "midi_in=%lu midi_out=%lu\n",
-                        g_config.sample_rate, g_config.preroll_frames, (int)g_baseline_locked, hw_err,
+                        g_config.sample_rate, g_config.preroll_frames, locked, q_diff,
                         sink_q, s_sink_ratio, (int)s_sink_active, g_sink_underruns, g_sink_overruns,
                         src_fps, src_q, s_source_ratio, (int)s_source_active, s_source_underruns, s_source_overruns,
                         g_active_iso_transfers, (unsigned long)g_fb_packets_count, (unsigned int)g_fb_last_val,
@@ -1216,7 +1177,7 @@ int main(int argc, char **argv) {
                     fprintf(fhist, "%lu,%u,%.6f,%d,%u,%.6f,%d,%ld,%u,%u,%u,%u\n",
                             (unsigned long)time(NULL), sink_q, s_sink_ratio, (int)s_sink_active,
                             src_q, s_source_ratio, (int)s_source_active,
-                            hw_err, g_sink_underruns, g_sink_overruns, s_source_underruns, s_source_overruns);
+                            q_diff, g_sink_underruns, g_sink_overruns, s_source_underruns, s_source_overruns);
                     fclose(fhist);
                 }
             }
@@ -1239,6 +1200,11 @@ int main(int argc, char **argv) {
         usleep(1000);
     }
     pthread_join(iso_thread, NULL);
+
+    // Stop FPGA streaming engine and mute hardware DAC to prevent underrun screech on shutdown
+    if (g_handle) {
+        libusb_control_transfer(g_handle, 0x40, 0x49, 0x0000, 0x0002, NULL, 0, 1000);
+    }
 
     for (int t = 0; t < NUM_ISO_TRANSFERS; t++) {
         libusb_free_transfer(iso_xfers[t]);

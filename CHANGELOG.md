@@ -5,9 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] - 2026-10-29
 
 ### Added
+- Native 32-bit floating-point PipeWire stream bridging (`SPA_AUDIO_FORMAT_F32_LE`) and 24-bit packed PCM on `EP 0x02`, eliminating 16-bit truncation and quantization distortion ([#10](https://github.com/Aerankas/tascam_us1641_linux/issues/10)).
+- Direct hardware feedback pacing (`EP 0x81` $\to$ `EP 0x02`) utilizing a lockless token FIFO to synchronize USB transfers with the physical DAC consumption rate matching the official Windows driver.
+- Configured native Pro Audio channel positions (`audio.position = [ AUX0..AUX15 ]`) and disabled sound server channel matrixing (`channelmix.disable = true`) on `tascam_us1641_source`.
 - Full hardware MIDI Input and Output support for the US-1641's 5-pin DIN ports via USB bulk endpoints `EP 0x83` (MIDI IN) and `EP 0x04` (MIDI OUT) ([#7](https://github.com/Aerankas/tascam_us1641_linux/issues/7)):
   - Implemented 9-byte USB frame packetizer and depacketizer with `0xFD` pad filtering and `0xE0` delimiter alignment.
   - Native ALSA Sequencer integration (`TASCAM US-1641 MIDI In` and `MIDI Out`) with bidirectional byte translation.
@@ -16,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `libasound2-dev` / `alsa-lib-devel` dependency checks to `install.sh` and build system.
 
 ### Fixed
+- Fixed 40 Hz playback and capture sample-slip buzzing caused by evaluating raw quantum-sawtooth buffer depths against narrow deadbands; implemented low-pass filtered queue depth tracking with a wide $\pm 1024$-frame deadband ([#10](https://github.com/Aerankas/tascam_us1641_linux/issues/10)).
+- Removed fractional-phase linear interpolation on playback and capture streams to eliminate phase flutter and granulation artifacts.
+- Fixed random channel pair swapping (`In 01 ↔ In 02`, `In 09 ↔ In 10`) across daemon restarts by eliminating an erroneous `0x49, 0x0000, 0x0000` control transfer on shutdown that pushed an odd 15-frame packet into the hardware FIFO.
+- Corrected FPGA bitplane parity mapping so physical front-panel line/guitar inputs and mic preamps map accurately to corresponding channels.
+- Updated protocol specification documentation (`docs/protocol-spec.md`) with accurate bitplane parity mappings and closed-loop feedback mechanics.
 - Fixed 32-bit signed integer overflow in Bulk IN frame parity decoder (`g_global_frame_idx`), which caused permanent capture silence after 6.2 hours of continuous streaming ([#5](https://github.com/Aerankas/tascam_us1641_linux/issues/5)).
 - Added line buffering (`setlinebuf`) for `stdout` and `stderr` to ensure real-time logging in `systemd` user journals.
 - Added fallback preprocessor macros for `PW_KEY_NODE_PHYSICAL`, `PW_KEY_NODE_TERMINAL`, and related PipeWire properties, fixing compilation failure on older `libpipewire-0.3` versions such as PipeWire < 1.2 on Ubuntu 24.04 LTS and Linux Mint 22 ([#1](https://github.com/Aerankas/tascam_us1641_linux/issues/1)).
