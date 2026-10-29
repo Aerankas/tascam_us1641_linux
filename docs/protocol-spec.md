@@ -64,22 +64,22 @@ Unlike standard interleaved PCM, the US-1641 FPGA serializes 14 analog ADC chann
 - **Bytes `0..23` (24 rows)**: Bitplane rows from **MSB (Bit 23 at Byte 0)** down to **LSB (Bit 0 at Byte 23)**.
 - **Bits `0..6` of each byte**: 7 analog channels:
   - **EVEN Frame (`frame_idx % 2 == 0`)**:
-    - Bit `b` (`0..6`) $\rightarrow$ Channel `2 * b` (`In 1, 3, 5, 7, 9, 11, 13`)
+    - Bit `b` (`0..6`) $\rightarrow$ Top Row Channel `2 * b` (`In 1, 3, 5, 7, 9, 11, 13`)
   - **ODD Frame (`frame_idx % 2 == 1`)**:
-    - Bit `b` (`0..6`) $\rightarrow$ Channel `2 * b + 1` (`In 2, 4, 6, 8, 10, 12, 14`)
-- **Bytes `24..31` (8 bytes)**: Aux / S/PDIF status and digital audio framing (`0x00 00 00 80` on EVEN frames, `0x00 00 00 40` on ODD frames).
+    - Bit `b` (`0..6`) $\rightarrow$ Bottom Row Channel `2 * b + 1` (`In 2, 4, 6, 8, 10, 12, 14`)
+- **Bytes `24..31` (8 bytes)**: Aux / S/PDIF status and digital audio framing.
 
 ### Demuxing Algorithm (C Reference)
 
 ```c
 for (int b = 0; b < 7; b++) {
-    int ch_idx = (parity == 0) ? (2 * b) : (2 * b + 1); // 0..13
+    int ch_idx = (parity == 0) ? (2 * b) : (2 * b + 1); // 0..13 (0=In 1, 1=In 2, etc.)
     int32_t val = 0;
     for (int bit = 0; bit < 24; bit++) {
         val = (val << 1) | ((frame[bit] >> b) & 1);
     }
     if (val & 0x800000) val -= 0x1000000; // Sign-extend 24-bit to 32-bit
-    sample_s16[ch_idx] = (int16_t)(val >> 8);
+    sample_f32[ch_idx] = (float)val * (1.0f / 8388608.0f);
 }
 ```
 
