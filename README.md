@@ -5,6 +5,7 @@
 [![Hardware: USB 0644:8017](https://img.shields.io/badge/USB-0644%3A8017-orange.svg)](#hardware-overview)
 
 A full-duplex, low-latency **PipeWire audio bridge daemon (`tascamd`)** and **Graphical Hardware Control Panel** for the **TASCAM US-1641** 16x4 USB 2.0 Studio Audio Interface on Linux.
+Development was aided by LLM.  Obviously.
 
 ---
 
@@ -36,6 +37,10 @@ Historically, the experimental Linux kernel `snd-usb-us122l` driver failed on mo
   - Tracks real-time hardware DAC sample consumption tokens every millisecond, locking host USB output 1:1 to the TASCAM's internal crystal oscillator with $\pm 1$ sample accuracy—eliminating long-term clock drift and FIFO wrap distortion.
 - **Asynchronous Bulk Capture Pipeline**:
   - 4-stage pipelined asynchronous USB bulk transfers (`16 KB` chunks) paired with a 32.32 fixed-point fractional linear resampler, preventing capture dropouts during multi-track recording.
+- **Hardware MIDI Input & Output (5-Pin DIN)**:
+  - Bridges the US-1641's hardware MIDI IN (`EP 0x83`) and MIDI OUT (`EP 0x04`) ports directly to the Linux ALSA Sequencer (`TASCAM US-1641 MIDI In` and `MIDI Out`).
+  - Automatically mapped into the PipeWire / JACK graph as `Midi-Bridge:TASCAM US-1641:MIDI In (capture)` and `MIDI Out (playback)`.
+  - Connect digital drum kits, keyboard controllers, synthesizers, and drum machines directly to DAWs and virtual instruments (Reaper, Ardour, Hydrogen, Superior Drummer, EZDrummer) with ultra-low latency.
 - **Graphical Hardware Control Panel (PyQt6)**:
   - Native desktop GUI for switching sample rates (`48 kHz` / `44.1 kHz`), adjusting PipeWire buffer size / latency quantum (`64` to `1024` samples), tuning pre-roll jitter buffers, and monitoring live DAC lock & dropout telemetry.
 
@@ -121,6 +126,18 @@ pw-jack ardour9
 The TASCAM US-1641 features a front-panel **`MIX` (`INPUT` $\leftrightarrow$ `COMPUTER`)** balance knob:
 - **Zero-Latency Hardware Monitoring**: Blend `INPUT` and `COMPUTER` on the front panel to hear your dry microphone/guitar signal directly from the hardware preamps with zero latency. *(Ensure your DAW track is set to monitor **Disk** rather than **In** so you don't hear a doubled signal).*
 - **Live Software Plugin Monitoring (Amp Sims / Reverb)**: Turn the front-panel `MIX` knob fully clockwise to **`COMPUTER`**, and enable **Input Monitoring (`In`)** on your DAW track.
+
+### 4. Routing MIDI Instruments & Digital Drum Kits
+
+The US-1641's physical 5-pin DIN **MIDI IN** and **MIDI OUT** ports appear automatically in ALSA and PipeWire:
+- **MIDI Input**: `Midi-Bridge:TASCAM US-1641:MIDI In (capture)`
+- **MIDI Output**: `Midi-Bridge:TASCAM US-1641:MIDI Out (playback)`
+
+To connect a digital drum kit or keyboard synthesizer:
+1. Connect a standard 5-pin DIN MIDI cable from your drum module's **MIDI OUT** port to the TASCAM US-1641 front-panel **MIDI IN** port.
+2. In your DAW (Reaper, Ardour, Bitwig) or drum sampler (Hydrogen, Carla, sfizz, EZDrummer / Superior Drummer via Wine), create an Instrument/MIDI track.
+3. Select **TASCAM US-1641 MIDI In** as the MIDI input device.
+4. Arm the track for live monitoring or recording to trigger drum samplers with zero latency.
 
 ---
 
