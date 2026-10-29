@@ -5,6 +5,7 @@
 [![Hardware: USB 0644:8017](https://img.shields.io/badge/USB-0644%3A8017-orange.svg)](#hardware-overview)
 
 A full-duplex, low-latency **PipeWire audio bridge daemon (`tascamd`)** and **Graphical Hardware Control Panel** for the **TASCAM US-1641** 16x4 USB 2.0 Studio Audio Interface on Linux.
+Development was aided by LLM.  Obviously.
 
 ---
 
